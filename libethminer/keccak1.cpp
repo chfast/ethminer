@@ -1,6 +1,13 @@
 
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <cassert>
+
+#include <iostream>
+#include <iomanip>
+
+#include "ethminer.h"
 
 namespace
 {
@@ -18,10 +25,10 @@ namespace
 
 	constexpr uint64_t rot(uint64_t x, uint64_t s) { return x << s | x >> (64 - s); }
 
-#define REPEAT6(e)  e e e e e e
-#define REPEAT24(e) REPEAT6(e e e e)
-#define REPEAT5(e)  e e e e e
-#define FOR5(v, s, e) v = 0; REPEAT5(e; v += s;)
+	#define REPEAT6(e)  e e e e e e
+	#define REPEAT24(e) REPEAT6(e e e e)
+	#define REPEAT5(e)  e e e e e
+	#define FOR5(v, s, e) v = 0; REPEAT5(e; v += s;)
 
 	/// Keccak-f[1600]
 	inline void keccakf1600(uint64_t* a) noexcept
@@ -89,8 +96,6 @@ namespace
 		std::memcpy(out, a, outSize); // TODO: How about using out as a state
 	}
 
-
-
 	inline void hash_1(uint64_t* out, size_t outSize, const uint64_t* data, size_t size)
 	{
 		const auto r = 200 - (2 * outSize); // 256: 136, 512: 72
@@ -102,24 +107,131 @@ namespace
 		std::memcpy(out, a, outSize); // TODO: How about using out as a state
 	}
 
+	void dump(void const* data, uint64_t size)
+	{
+		auto bytes = (uint8_t const*)data;
+		for (auto b = bytes; b != bytes + size; ++b)
+			std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)*b;
+		std::cerr << std::endl;
+	}
+
+	void dump(Hash64 const& h)
+	{
+		dump(&h, 64);
+	}
+
+	void dump(Hash32 const& h)
+	{
+		dump(&h, 32);
+	}
+
+	bool less(Hash32 const& h, Hash32 const& g)
+	{
+		for (uint64_t i = 0; i < h.size(); ++i)
+		{
+			if (h[i] < g[i])
+				return true;
+			else if (h[i] > g[i])
+				return false;
+		}
+		return false;
+	}
+
+	void keccak256(uint8_t* out, uint8_t const* data, size_t size)
+	{
+		hash((uint64_t*)out, 32, (uint64_t*)data, size);
+	}
+
+	void keccak512(uint8_t* out, uint8_t const* data, size_t size)
+	{
+		hash((uint64_t*)out, 64, (uint64_t*)data, size);
+	}
+
+	void keccak256_96(uint8_t* out, uint8_t const* data)
+	{
+		hash_1((uint64_t*)out, 32, (uint64_t*)data, 96 / 8);
+	}
+
+	void keccak512_40(uint8_t* out, uint8_t const* data)
+	{
+		hash_1((uint64_t*)out, 64, (uint64_t*)data, 40 / 8);
+	}
+
+	constexpr uint32_t fnv(uint32_t x, uint32_t y)
+	{
+		return x * 0x01000193 ^ y;
+	}
+
+	struct SeedInput
+		{
+			Hash32 header;
+			uint64_t nonce;
+		};
+
+	union MixElem
+	{
+		Hash64 hash;
+		uint32_t words[sizeof(Hash64) / sizeof(uint32_t)];
+	};
+
+	struct SMix
+	{
+		union 
+		{
+			Hash64 seed;
+			uint32_t seedWord;
+		};	
+		Mix mix;
+	};
+
+	void computeEthash(Hash32& o_ret, Mix const* slices, uint32_t nSlices, Hash32 const& header, uint64_t nonce, Hash32* o_cmix)
+	{
+		// TODO: How about computing many hashes for different nonces?
+	    SMix smix;
+	    auto& seed = smix.seed;
+	    auto& mix = smix.mix;
+
+	    auto seedInput = SeedInput{header, nonce};
+	    keccak512_40((uint8_t*)&seed, (const uint8_t*)&seedInput);
+	    static_assert(nMixHashes == 2, "Update seed replication");
+	    mix.hashes[0] = mix.hashes[1] = seed;
+
+	    for (uint32_t i = 0; i != nAccesses; ++i)
+	    {
+	        auto p = fnv(smix.seedWord ^ i, mix.words[i % nMixWords]) % nSlices;
+	        auto& slice = slices[p];
+	        for (uint32_t j = 0; j < nMixWords; ++j)
+	        	mix.words[j] = fnv(mix.words[j], slice.words[j]);
+	    }
+
+	    for (uint64_t i = 0; i < nMixWords; i += 4)
+	    {
+	        auto c = fnv(mix.words[i + 0], mix.words[i + 1]);
+	        c = fnv(c, mix.words[i + 2]);
+	        c = fnv(c, mix.words[i + 3]);
+	        mix.words[i / 4] = c;
+	    }
+
+	    if (o_cmix)
+	    	std::memcpy(o_cmix, &mix, 32);
+	    keccak256_96((uint8_t*)&o_ret, (uint8_t*)&smix); // TODO: Can we check target during computation of keccak?
+	}
+
 }
 
-void keccak256(uint8_t* out, uint8_t const* data, size_t size)
+uint64_t search(Result* ret, Mix const* slices, uint32_t nSlices, Hash32 const& header, uint64_t nonce, uint64_t tries, Hash32 const& target)
 {
-	hash((uint64_t*)out, 32, (uint64_t*)data, size);
-}
-
-void keccak512(uint8_t* out, uint8_t const* data, size_t size)
-{
-	hash((uint64_t*)out, 64, (uint64_t*)data, size);
-}
-
-void keccak256_96(uint8_t* out, uint8_t const* data)
-{
-	hash_1((uint64_t*)out, 32, (uint64_t*)data, 96 / 8);
-}
-
-void keccak512_40(uint8_t* out, uint8_t const* data)
-{
-	hash_1((uint64_t*)out, 64, (uint64_t*)data, 40 / 8);
+	//dump(target);
+	for (uint64_t i = 0; i < tries; ++i)
+	{
+		Hash32 h;
+		computeEthash(h, slices, nSlices, header, nonce, nullptr);
+		if (less(h, target))
+		{
+			//std::memcpy(ret, &h, sizeof(h));
+			return nonce;
+		}
+		++nonce;
+	}
+	return 0;
 }
